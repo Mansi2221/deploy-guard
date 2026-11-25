@@ -1,0 +1,117 @@
+name: 'Deploy Guard'
+description: 'Block merges if deployment readiness checks fail — env vars, Dockerfile, secrets, CI/CD'
+author: 'Mansi2221'
+
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  skip-checks:
+    description: 'Comma-separated checks to skip: env,docker,secrets,ci'
+    required: false
+    default: ''
+  env-example-path:
+    description: 'Path to .env.example file'
+    required: false
+    default: '.env.example'
+  dockerfile-path:
+    description: 'Path to Dockerfile (auto-detected if empty)'
+    required: false
+    default: ''
+  fail-on-warnings:
+    description: 'Treat warnings as failures'
+    required: false
+    default: 'false'
+
+outputs:
+  passed:
+    description: 'Whether all checks passed (true/false)'
+    value: ${{ steps.summary.outputs.passed }}
+  report:
+    description: 'Full check report'
+    value: ${{ steps.summary.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check environment variables
+      if: ${{ !contains(inputs.skip-checks, 'env') }}
+      id: env
+      shell: bash
+      run: bash ${{ github.action_path }}/scripts/check-env.sh "${{ inputs.env-example-path }}"
+
+    - name: Check Dockerfile
+      if: ${{ !contains(inputs.skip-checks, 'docker') }}
+      id: docker
+      shell: bash
+      run: bash ${{ github.action_path }}/scripts/check-docker.sh "${{ inputs.dockerfile-path }}"
+
+    - name: Check for exposed secrets
+      if: ${{ !contains(inputs.skip-checks, 'secrets') }}
+      id: secrets
+      shell: bash
+      run: bash ${{ github.action_path }}/scripts/check-secrets.sh
+
+    - name: Check CI/CD pipeline
+      if: ${{ !contains(inputs.skip-checks, 'ci') }}
+      id: ci
+      shell: bash
+      run: bash ${{ github.action_path }}/scripts/check-ci.sh
+
+    - name: Generate summary
+      id: summary
+      shell: bash
+      run: |
+        FAILURES=0
+        REPORT=""
+
+        for step_name in env docker secrets ci; do
+          skip="${{ inputs.skip-checks }}"
+          if echo "$skip" | grep -q "$step_name"; then
+            REPORT="${REPORT}| ${step_name} | skipped | — |\n"
+            continue
+          fi
+        done
+
+        # Read result files written by each check
+        for result_file in /tmp/deploy-guard-*.result; do
+          [ -f "$result_file" ] || continue
+          name=$(basename "$result_file" | sed 's/deploy-guard-//;s/.result//')
+          status=$(head -1 "$result_file")
+          details=$(tail -n +2 "$result_file" | head -5 | tr '\n' ' ')
+          REPORT="${REPORT}| ${name} | ${status} | ${details} |\n"
+          if [ "$status" = "FAIL" ]; then
+            FAILURES=$((FAILURES + 1))
+          fi
+          if [ "$status" = "WARN" ] && [ "${{ inputs.fail-on-warnings }}" = "true" ]; then
+            FAILURES=$((FAILURES + 1))
+          fi
+        done
+
+        # Write step summary
+        {
+          echo "## Deploy Guard Results"
+          echo ""
+          echo "| Check | Status | Details |"
+          echo "|-------|--------|---------|"
+          echo -e "$REPORT"
+          echo ""
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "> **$FAILURES check(s) failed.** Fix them before merging."
+          else
+            echo "> All checks passed."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        echo "report<<EOF" >> "$GITHUB_OUTPUT"
+        echo -e "$REPORT" >> "$GITHUB_OUTPUT"
+        echo "EOF" >> "$GITHUB_OUTPUT"
+
+        if [ "$FAILURES" -gt 0 ]; then
+          echo "passed=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Deploy Guard: $FAILURES check(s) failed"
+          exit 1
+        else
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+        fi
